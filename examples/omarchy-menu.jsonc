@@ -1,0 +1,18 @@
+{
+  "setup.keybindings": {
+    "icon": "",
+    "label": "Keyboard Shortcuts",
+    "description": "Create and edit application and system shortcuts",
+    "action": ""
+  },
+  "setup.keybindings.create": {
+    "icon": "",
+    "label": "Create a shortcut",
+    "action": "omarchy-shell shell summon io.github.splashymorningstar.keybindings '{\"mode\":\"create\"}'"
+  },
+  "setup.keybindings.edit": {
+    "icon": "󰏫",
+    "label": "Edit a shortcut",
+    "action": "omarchy-shell shell summon io.github.splashymorningstar.keybindings '{\"mode\":\"edit\"}'"
+  }
+}

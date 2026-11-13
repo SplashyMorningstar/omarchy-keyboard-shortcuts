@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.splashymorningstar.keybindings",
+  "name": "Keyboard Shortcuts",
+  "version": "0.2.0",
+  "author": "SplashyMorningstar",
+  "description": "Create and manage application and system keyboard shortcuts.",
+  "kinds": [
+    "menu"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "menu": "Keybindings.qml"
+  }
+}

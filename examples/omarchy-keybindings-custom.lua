@@ -1,0 +1,12 @@
+-- User-owned custom shortcuts.
+-- This file is loaded by ~/.config/hypr/omarchy-keybindings.lua.
+-- Save it to reload Hyprland; run `hyprctl configerrors` to check the result.
+--
+-- Add a shortcut for an application:
+-- o.bind("SUPER + ALT + O", "Open Obsidian", { launch = "obsidian" })
+--
+-- Run a program or script directly:
+-- o.bind("SUPER + ALT + S", "Run my script", "/home/you/bin/my-script.sh")
+--
+-- Use o.rebind(...) instead of o.bind(...) when intentionally replacing
+-- an existing shortcut. Commands run with your user permissions.
