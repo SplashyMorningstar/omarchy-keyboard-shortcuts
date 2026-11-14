@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.splashymorningstar.keybindings",
   "name": "Keyboard Shortcuts",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "SplashyMorningstar",
   "description": "Create and manage application and system keyboard shortcuts.",
   "kinds": [

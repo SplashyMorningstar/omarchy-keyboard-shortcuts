@@ -23,14 +23,13 @@ and write their own `o.bind(...)` or `o.rebind(...)` commands.
 - **Enter:** choose the focused option or confirm the current step.
 - **Escape:** return to the previous step; close the plugin from the first step.
 - **Tab/Shift+Tab:** move between controls, including remove and close buttons.
-- During shortcut capture, click **Pause global shortcuts and capture** before
-  pressing a key combination. The plugin temporarily disables Hyprland keyboard
-  shortcuts so an existing binding cannot launch an app while you record it.
-  Bindings are restored as soon as capture ends, when the panel closes, or
-  automatically after three minutes if the capture is interrupted.
-- If capture mode cannot start, or you prefer not to pause shortcuts, click the
-  text field or press Tab to type a chord such as `SUPER + SHIFT + M`, then
-  press Enter to check it for conflicts.
+- Shortcut capture automatically pauses Hyprland keyboard shortcuts so an
+  existing binding cannot launch an app while you record it. Bindings are
+  restored as soon as capture ends, when the panel closes, or automatically
+  after three minutes if the capture is interrupted.
+- To enter a chord such as `SUPER + SHIFT + M` manually, click the text field or
+  press Tab, then press Enter to check it for conflicts. If safe capture cannot
+  start, the **Retry safe capture** button is available.
 - In the occupied-shortcut prompt, choose **Rewrite shortcut** or **Cancel**
   with the arrow keys, Tab, or Enter. Escape cancels the rewrite.
 - In search fields, type to filter. Down enters the results; Up from the first

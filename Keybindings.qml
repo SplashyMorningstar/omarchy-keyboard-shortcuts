@@ -146,6 +146,16 @@ Item {
     root.startHelper(args, task)
   }
 
+  function hasQueuedHelper(task) {
+    for (var i = 0; i < root.helperQueue.length; i++)
+      if (root.helperQueue[i].task === task) return true
+    return false
+  }
+
+  function removeQueuedHelpers(task) {
+    root.helperQueue = root.helperQueue.filter(function(item) { return item.task !== task })
+  }
+
   function startHelper(args, task) {
     root.pendingHelperTask = task
     root.helperOutput = ""
@@ -191,7 +201,7 @@ Item {
         }
         root.captureModeActive = true
         root.statusIsError = false
-        root.statusMessage = strings.t("captureModeActive")
+        root.statusMessage = ""
         Qt.callLater(function() { interactionInput.forceActiveFocus() })
       } else {
         root.captureModeActive = false
@@ -203,7 +213,7 @@ Item {
       return
     }
     if (task === "capture-stop") {
-      root.captureModePending = false
+      root.captureModePending = root.hasQueuedHelper("capture-start")
       root.captureModeActive = false
       if (result && !result.ok && root.opened) {
         root.statusIsError = true
@@ -223,7 +233,7 @@ Item {
       }
       if (task === "capture-stop") {
         root.captureModeActive = false
-        root.captureModePending = false
+        root.captureModePending = root.hasQueuedHelper("capture-start")
         if (root.opened) {
           root.statusIsError = true
           root.statusMessage = strings.t("captureModeRestoreFailed")
@@ -486,7 +496,7 @@ Item {
     else if (root.page === "actions") root.focusSystemAction(root.actionSelectedIndex)
     else if (root.page === "edit") shortcutSearchField.forceActiveFocus()
     else if (root.page === "capture") {
-      if (root.captureModeActive) interactionInput.forceActiveFocus()
+      if (root.captureModeActive || root.captureModePending) interactionInput.forceActiveFocus()
       else captureStartButton.forceActiveFocus()
     }
     else if (root.page === "confirm") saveShortcutButton.forceActiveFocus()
@@ -587,19 +597,28 @@ Item {
     root.captureModeActive = false
     root.captureModePending = false
     root.statusMessage = ""
-    Qt.callLater(function() { captureStartButton.forceActiveFocus() })
+    Qt.callLater(function() { root.startSafeCapture() })
   }
 
   function startSafeCapture() {
-    if (root.captureModeActive || root.captureModePending || helperProcess.running) return
+    if (root.captureModeActive || root.captureModePending) return
     root.statusMessage = ""
     root.statusIsError = false
     root.captureModePending = true
+    interactionInput.forceActiveFocus()
     root.runHelper(["capture-start"], "capture-start")
   }
 
   function stopSafeCapture() {
     if (!root.captureModeActive && !root.captureModePending) return
+    if (!root.captureModeActive
+        && root.hasQueuedHelper("capture-start")
+        && root.pendingHelperTask !== "capture-start") {
+      root.removeQueuedHelpers("capture-start")
+      root.manualEntryActive = false
+      root.captureModePending = false
+      return
+    }
     root.captureModeActive = false
     root.manualEntryActive = false
     root.captureModePending = false
@@ -830,7 +849,7 @@ Item {
       Qt.callLater(function() { root.focusCurrentPage() })
     } else if (root.page === "confirm") {
       root.page = "capture"
-      Qt.callLater(function() { root.focusCurrentPage() })
+      Qt.callLater(function() { root.startSafeCapture() })
     } else {
       if (root.page === "chooseType" && root.returnPageAfterTarget === "edit") {
         root.page = "edit"
@@ -845,7 +864,7 @@ Item {
     root.statusMessage = ""
     if (root.page === "confirm") {
       root.page = "capture"
-      Qt.callLater(function() { root.focusCurrentPage() })
+      Qt.callLater(function() { root.startSafeCapture() })
     } else if (root.page === "capture") {
       root.stopSafeCapture()
       root.manualEntryActive = false
@@ -994,15 +1013,19 @@ Item {
           y: 0
           width: 1
           height: 1
-          visible: (root.page === "capture" && root.captureModeActive)
+          visible: (root.page === "capture" && (root.captureModeActive || root.captureModePending))
             || overwriteDialog.opened || removeDialog.opened
           opacity: 0
           focus: visible && !(root.page === "capture" && root.manualEntryActive)
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
-            if (root.page === "capture" && root.captureModeActive) root.captureKey(event)
-            else root.editDialogKey(event)
-            event.accepted = true
+            if (root.page === "capture") {
+              if (root.captureModeActive) root.captureKey(event)
+              else event.accepted = true
+            } else {
+              root.editDialogKey(event)
+              event.accepted = true
+            }
           }
         }
       }
@@ -1603,11 +1626,9 @@ Item {
 
             Button {
               id: captureStartButton
-              visible: !root.captureModeActive
+              visible: !root.captureModeActive && !root.captureModePending
               width: parent.width
-              text: root.captureModePending
-                ? strings.t("startingCaptureMode")
-                : strings.t("startCaptureMode")
+              text: strings.t("retryCaptureMode")
               iconText: "󰌌"
               fontFamily: root.fontFamily
               foreground: Commons.Color.menu.text
@@ -1616,6 +1637,17 @@ Item {
               enabled: !root.captureModePending && !helperProcess.running
               Keys.onPressed: function(event) { root.handleButtonNavigation(event, "capture") }
               onClicked: root.startSafeCapture()
+            }
+
+            Text {
+              width: parent.width
+              visible: root.captureModePending
+              textFormat: Text.PlainText
+              text: strings.t("startingCaptureMode")
+              color: Commons.Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
             }
 
             Text {
@@ -1749,6 +1781,7 @@ Item {
                 root.capturedKeys = root.currentKeys
                 root.page = "confirm"
                 root.confirmFocusIndex = 0
+                root.stopSafeCapture()
                 Qt.callLater(function() { saveShortcutButton.forceActiveFocus() })
               }
             }
