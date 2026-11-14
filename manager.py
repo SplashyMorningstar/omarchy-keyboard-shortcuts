@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import itertools
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ KEY_RE = re.compile(r"^[A-Za-z0-9_:+.-]{1,64}$")
 APP_ID_RE = re.compile(r"^[^/\\\x00-\x1f\x7f]{1,255}$")
 MAX_NAME_LENGTH = 128
 MAX_BINDINGS = 300
+CAPTURE_WATCHDOG_SECONDS = 180
 SYSTEM_ACTIONS = {
     "screenshot": {
         "name": "Screenshot",
@@ -84,6 +87,10 @@ def database_file() -> Path:
 
 def backup_dir() -> Path:
     return state_dir() / "backups"
+
+
+def capture_state_file() -> Path:
+    return state_dir() / "capture-session.json"
 
 
 def emit(value: dict[str, Any]) -> None:
@@ -145,6 +152,11 @@ def normalize_chord(value: str) -> tuple[str, int, str]:
 def chord_from_bind(bind: dict[str, Any]) -> tuple[str, int, str] | None:
     try:
         key = str(bind.get("key", "")).strip()
+        if not key and bind.get("keycode") is not None:
+            keycode = int(bind["keycode"])
+            if keycode < 0:
+                return None
+            key = f"code:{keycode}"
         if not KEY_RE.fullmatch(key):
             return None
         mask = int(bind.get("modmask", 0))
@@ -154,6 +166,15 @@ def chord_from_bind(bind: dict[str, Any]) -> tuple[str, int, str] | None:
         return " + ".join(mods + [key]), mask, key
     except (TypeError, ValueError):
         return None
+
+
+def unbind_variants(mask: int, key: str) -> list[str]:
+    """Return modifier orderings Hyprland may require for an existing bind."""
+    modifiers = [name for name in MODIFIER_ORDER if mask & MODIFIERS[name]]
+    return [
+        " + ".join((*ordered, key))
+        for ordered in itertools.permutations(modifiers)
+    ]
 
 
 def load_records() -> list[dict[str, Any]]:
@@ -538,6 +559,161 @@ def reload_hyprland(before_errors: list[str] | None = None) -> tuple[bool, str]:
     return True, ""
 
 
+def run_hyprland_lua(code: str) -> None:
+    try:
+        result = subprocess.run(
+            ["hyprctl", "eval", code],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"couldn't pause keyboard shortcuts: {error}") from error
+    if result.returncode != 0:
+        raise RuntimeError(
+            clean_text(result.stderr or result.stdout, 1000)
+            or "Hyprland couldn't pause keyboard shortcuts"
+        )
+
+
+def read_capture_state() -> dict[str, Any] | None:
+    try:
+        value = json.loads(capture_state_file().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def clear_capture_state(token: str) -> None:
+    path = capture_state_file()
+    state = read_capture_state()
+    if state and state.get("token") == token:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def capture_start() -> None:
+    state_path = capture_state_file()
+    if state_path.exists():
+        existing = read_capture_state()
+        if existing and time.time() - float(existing.get("startedAt", 0)) > CAPTURE_WATCHDOG_SECONDS:
+            success, message = reload_hyprland(existing.get("beforeErrors", []))
+            if not success:
+                raise RuntimeError(f"couldn't recover the previous capture session: {message}")
+            clear_capture_state(str(existing.get("token", "")))
+        else:
+            raise RuntimeError("keyboard shortcut capture is already active")
+
+    before_errors = config_errors()
+    chords = set()
+    unbind_chords = set()
+    for bind in current_binds():
+        if bind.get("mouse") or bind.get("submap"):
+            continue
+        chord = chord_from_bind(bind)
+        if chord:
+            chords.add(chord[0])
+            _, mask, key = chord
+            unbind_chords.update(unbind_variants(mask, key))
+
+    token = uuid.uuid4().hex
+    state = {
+        "token": token,
+        "startedAt": time.time(),
+        "beforeErrors": before_errors,
+        "chords": sorted(chords),
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_atomic(
+        state_path,
+        (json.dumps(state, ensure_ascii=False) + "\n").encode("utf-8"),
+    )
+
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "capture-watchdog",
+                "--token",
+                token,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        clear_capture_state(token)
+        raise RuntimeError(f"couldn't start keyboard-capture recovery timer: {error}") from error
+
+    try:
+        lua_chords = ", ".join(lua_string(chord) for chord in sorted(unbind_chords))
+        if lua_chords:
+            run_hyprland_lua(
+                "for _, chord in ipairs({" + lua_chords + "}) do hl.unbind(chord) end"
+            )
+        remaining = set()
+        for bind in current_binds():
+            if bind.get("mouse") or bind.get("submap"):
+                continue
+            chord = chord_from_bind(bind)
+            if chord:
+                remaining.add(chord[0].casefold())
+        still_active = sorted(chord for chord in chords if chord.casefold() in remaining)
+        if still_active:
+            raise RuntimeError(
+                "some keyboard shortcuts could not be paused: " + ", ".join(still_active[:5])
+            )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        restored, restore_error = reload_hyprland(before_errors)
+        if restored:
+            clear_capture_state(token)
+        detail = f"couldn't pause keyboard shortcuts: {error}"
+        if not restored:
+            detail += f"; recovery reload failed: {restore_error}"
+        raise RuntimeError(detail) from error
+
+
+def capture_stop() -> None:
+    state = read_capture_state()
+    if not state:
+        emit({"ok": True, "message": "keyboard shortcuts are already active"})
+        return
+
+    before_errors = state.get("beforeErrors")
+    if not isinstance(before_errors, list):
+        before_errors = []
+    success, message = reload_hyprland(before_errors)
+    if not success:
+        raise RuntimeError(f"couldn't restore keyboard shortcuts: {message}")
+    clear_capture_state(str(state.get("token", "")))
+    emit({"ok": True})
+
+
+def capture_watchdog(token: str) -> None:
+    deadline = time.monotonic() + CAPTURE_WATCHDOG_SECONDS
+    while time.monotonic() < deadline:
+        state = read_capture_state()
+        if not state or state.get("token") != token:
+            return
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    state = read_capture_state()
+    if not state or state.get("token") != token:
+        return
+    before_errors = state.get("beforeErrors")
+    if not isinstance(before_errors, list):
+        before_errors = []
+    success, _ = reload_hyprland(before_errors)
+    if success:
+        clear_capture_state(token)
+
+
 def snapshot(path: Path) -> bytes | None:
     try:
         return path.read_bytes()
@@ -861,6 +1037,10 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("uninstall")
     commands.add_parser("list-custom")
     commands.add_parser("list-system")
+    commands.add_parser("capture-start")
+    commands.add_parser("capture-stop")
+    watchdog = commands.add_parser("capture-watchdog")
+    watchdog.add_argument("--token", required=True)
 
     save = commands.add_parser("save-app")
     save.add_argument("--desktop-id", required=True)
@@ -920,6 +1100,13 @@ def main(argv: list[str] | None = None) -> int:
             emit({"ok": True, "entries": load_records()})
         elif args.command == "list-system":
             emit({"ok": True, "entries": system_bindings()})
+        elif args.command == "capture-start":
+            capture_start()
+            emit({"ok": True})
+        elif args.command == "capture-stop":
+            capture_stop()
+        elif args.command == "capture-watchdog":
+            capture_watchdog(args.token)
         elif args.command == "save-app":
             entry = save_app(
                 args.desktop_id,

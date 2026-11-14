@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,18 @@ class ShortcutManagerTests(unittest.TestCase):
             manager.chord_from_bind({"key": "comma", "modmask": 64}),
             ("SUPER + comma", 64, "comma"),
         )
+
+    def test_chord_from_bind_handles_keycode_bindings(self):
+        self.assertEqual(
+            manager.chord_from_bind({"key": "", "keycode": 10, "modmask": 64}),
+            ("SUPER + code:10", 64, "code:10"),
+        )
+
+    def test_unbind_variants_include_each_modifier_order(self):
+        variants = manager.unbind_variants(73, "A")
+        self.assertEqual(len(variants), 6)
+        self.assertIn("SUPER + SHIFT + ALT + A", variants)
+        self.assertIn("SUPER + ALT + SHIFT + A", variants)
 
     def test_lua_string_escapes_quotes_backslashes_and_newlines(self):
         self.assertEqual(manager.lua_string('Yap "fast"\\\n'), '"Yap \\"fast\\"\\\\\\n"')
@@ -434,6 +447,96 @@ class ShortcutManagerTests(unittest.TestCase):
                 manager.save_app("example", "Example", "SUPER + D", entry_id="missing")
 
         persist.assert_not_called()
+
+    def test_capture_start_temporarily_unbinds_keyboard_shortcuts(self):
+        binds = [
+            {"key": "M", "modmask": 65, "description": "Music"},
+            {"key": "F12", "modmask": 12, "description": "Test"},
+            {"key": "A", "modmask": 73, "description": "Grok"},
+            {"key": "BTN_LEFT", "modmask": 0, "mouse": True},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(manager, "state_dir", return_value=Path(directory)),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "current_binds", side_effect=[binds, []]),
+                patch.object(manager.subprocess, "run") as run,
+            ):
+                run.return_value = subprocess.CompletedProcess(
+                    ["hyprctl"], 0, "ok", ""
+                )
+                with patch.object(manager.subprocess, "Popen") as popen:
+                    manager.capture_start()
+
+            lua_command = run.call_args.args[0][2]
+            self.assertIn("hl.unbind(chord)", lua_command)
+            self.assertIn('"SUPER + SHIFT + M"', lua_command)
+            self.assertIn('"CTRL + ALT + F12"', lua_command)
+            self.assertIn('"SUPER + SHIFT + ALT + A"', lua_command)
+            self.assertNotIn("BTN_LEFT", lua_command)
+            self.assertEqual(popen.call_count, 1)
+            state = json.loads((Path(directory) / "capture-session.json").read_text())
+            self.assertEqual(
+                state["chords"],
+                ["CTRL + ALT + F12", "SUPER + ALT + SHIFT + A", "SUPER + SHIFT + M"],
+            )
+
+    def test_capture_start_reloads_configuration_if_shortcuts_cannot_be_paused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(manager, "state_dir", return_value=Path(directory)),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(
+                    manager,
+                    "current_binds",
+                    return_value=[{"key": "M", "modmask": 65, "description": "Music"}],
+                ),
+                patch.object(manager.subprocess, "run") as run,
+                patch.object(manager, "reload_hyprland", return_value=(True, "")) as reload,
+            ):
+                run.return_value = subprocess.CompletedProcess(
+                    ["hyprctl"], 1, "", "failed"
+                )
+                with patch.object(manager.subprocess, "Popen"):
+                    with self.assertRaisesRegex(RuntimeError, "couldn't pause keyboard shortcuts"):
+                        manager.capture_start()
+
+            reload.assert_called_once_with([])
+            self.assertFalse((Path(directory) / "capture-session.json").exists())
+
+    def test_capture_stop_reloads_hyprland_and_clears_its_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "capture-session.json"
+            state_path.write_text(
+                json.dumps({"token": "capture-token", "beforeErrors": ["old warning"]}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(manager, "state_dir", return_value=Path(directory)),
+                patch.object(manager, "reload_hyprland", return_value=(True, "")) as reload,
+                patch.object(manager, "emit"),
+            ):
+                manager.capture_stop()
+
+            reload.assert_called_once_with(["old warning"])
+            self.assertFalse(state_path.exists())
+
+    def test_capture_watchdog_restores_shortcuts_when_capture_is_abandoned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "capture-session.json"
+            state_path.write_text(
+                json.dumps({"token": "capture-token", "beforeErrors": []}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(manager, "state_dir", return_value=Path(directory)),
+                patch.object(manager, "CAPTURE_WATCHDOG_SECONDS", 0),
+                patch.object(manager, "reload_hyprland", return_value=(True, "")) as reload,
+            ):
+                manager.capture_watchdog("capture-token")
+
+            reload.assert_called_once_with([])
+            self.assertFalse(state_path.exists())
 
 
 if __name__ == "__main__":

@@ -34,6 +34,10 @@ Item {
   property string originalDescription: ""
   property string currentKeys: ""
   property string capturedKeys: ""
+  property string manualShortcutText: ""
+  property bool manualEntryActive: false
+  property bool captureModeActive: false
+  property bool captureModePending: false
   property string selectedDesktopId: ""
   property string selectedAppName: ""
   property string selectedSystemAction: ""
@@ -123,6 +127,7 @@ Item {
   }
 
   function close() {
+    root.stopSafeCapture()
     root.opened = false
   }
 
@@ -177,7 +182,55 @@ Item {
     var result = null
     try { result = JSON.parse(root.helperOutput || "") } catch (e) {}
 
+    if (task === "capture-start") {
+      root.captureModePending = false
+      if (result && result.ok) {
+        if (!root.opened || root.page !== "capture") {
+          root.runHelper(["capture-stop"], "capture-stop")
+          return
+        }
+        root.captureModeActive = true
+        root.statusIsError = false
+        root.statusMessage = strings.t("captureModeActive")
+        Qt.callLater(function() { interactionInput.forceActiveFocus() })
+      } else {
+        root.captureModeActive = false
+        root.statusIsError = true
+        root.statusMessage = strings.t("captureModeFailed")
+          .arg((result && result.message) || root.helperStderr || "Unknown error")
+        Qt.callLater(function() { manualShortcutInput.forceActiveFocus() })
+      }
+      return
+    }
+    if (task === "capture-stop") {
+      root.captureModePending = false
+      root.captureModeActive = false
+      if (result && !result.ok && root.opened) {
+        root.statusIsError = true
+        root.statusMessage = strings.t("captureModeRestoreFailed").arg(result.message || "")
+      }
+      return
+    }
+
     if (!result) {
+      if (task === "capture-start") {
+        root.captureModePending = false
+        root.statusIsError = true
+        root.statusMessage = strings.t("captureModeFailed")
+          .arg(root.helperStderr || "No response from the shortcut manager.")
+        Qt.callLater(function() { manualShortcutInput.forceActiveFocus() })
+        return
+      }
+      if (task === "capture-stop") {
+        root.captureModeActive = false
+        root.captureModePending = false
+        if (root.opened) {
+          root.statusIsError = true
+          root.statusMessage = strings.t("captureModeRestoreFailed")
+            .arg(root.helperStderr || "No response from the shortcut manager.")
+        }
+        return
+      }
       if (task) {
         root.statusIsError = true
         root.statusMessage = strings.t("saveFailed").arg(root.helperStderr || "No response from the shortcut manager.")
@@ -245,6 +298,8 @@ Item {
     root.originalDescription = ""
     root.currentKeys = ""
     root.capturedKeys = ""
+    root.manualShortcutText = ""
+    root.manualEntryActive = false
     root.selectedEntry = null
     root.selectedDesktopId = ""
     root.selectedAppName = ""
@@ -430,7 +485,10 @@ Item {
     else if (root.page === "apps") applicationSearch.forceActiveFocus()
     else if (root.page === "actions") root.focusSystemAction(root.actionSelectedIndex)
     else if (root.page === "edit") shortcutSearchField.forceActiveFocus()
-    else if (root.page === "capture") interactionInput.forceActiveFocus()
+    else if (root.page === "capture") {
+      if (root.captureModeActive) interactionInput.forceActiveFocus()
+      else captureStartButton.forceActiveFocus()
+    }
     else if (root.page === "confirm") saveShortcutButton.forceActiveFocus()
     else if (root.page === "saved") createAnotherButton.forceActiveFocus()
   }
@@ -524,8 +582,28 @@ Item {
   function beginCapture() {
     root.page = "capture"
     root.capturedKeys = root.currentKeys
+    root.manualShortcutText = ""
+    root.manualEntryActive = false
+    root.captureModeActive = false
+    root.captureModePending = false
     root.statusMessage = ""
-    Qt.callLater(function() { interactionInput.forceActiveFocus() })
+    Qt.callLater(function() { captureStartButton.forceActiveFocus() })
+  }
+
+  function startSafeCapture() {
+    if (root.captureModeActive || root.captureModePending || helperProcess.running) return
+    root.statusMessage = ""
+    root.statusIsError = false
+    root.captureModePending = true
+    root.runHelper(["capture-start"], "capture-start")
+  }
+
+  function stopSafeCapture() {
+    if (!root.captureModeActive && !root.captureModePending) return
+    root.captureModeActive = false
+    root.manualEntryActive = false
+    root.captureModePending = false
+    root.runHelper(["capture-stop"], "capture-stop")
   }
 
   function keyName(key) {
@@ -562,6 +640,18 @@ Item {
   }
 
   function captureKey(event) {
+    if (!root.captureModeActive) {
+      event.accepted = true
+      return
+    }
+    if ((event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab)
+        && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+      root.manualEntryActive = true
+      Qt.callLater(function() { manualShortcutInput.forceActiveFocus() })
+      event.accepted = true
+      return
+    }
+
     if (event.key === Qt.Key_Escape) {
       root.cancelFlow()
       event.accepted = true
@@ -588,6 +678,7 @@ Item {
       root.statusMessage = ""
       root.page = "confirm"
       root.confirmFocusIndex = 0
+      root.stopSafeCapture()
       Qt.callLater(function() { saveShortcutButton.forceActiveFocus() })
       event.accepted = true
       return
@@ -617,8 +708,63 @@ Item {
     root.statusMessage = ""
     root.page = "confirm"
     root.confirmFocusIndex = 0
+    root.stopSafeCapture()
     Qt.callLater(function() { saveShortcutButton.forceActiveFocus() })
     event.accepted = true
+  }
+
+  function acceptManualShortcut() {
+    var parts = root.manualShortcutText.trim().split("+")
+    var modifiers = []
+    var key = ""
+    var allowedModifiers = ["SUPER", "CTRL", "ALT", "SHIFT"]
+
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i].trim()
+      if (!part) {
+        root.statusIsError = true
+        root.statusMessage = strings.t("manualShortcutInvalid")
+        return
+      }
+      var upper = part.toUpperCase()
+      if (allowedModifiers.indexOf(upper) >= 0) {
+        if (modifiers.indexOf(upper) >= 0) {
+          root.statusIsError = true
+          root.statusMessage = strings.t("manualShortcutInvalid")
+          return
+        }
+        modifiers.push(upper)
+      } else if (key) {
+        root.statusIsError = true
+        root.statusMessage = strings.t("manualShortcutInvalid")
+        return
+      } else {
+        key = part
+      }
+    }
+
+    if (!key || modifiers.length === 0
+        || allowedModifiers.indexOf(key.toUpperCase()) >= 0
+        || !/^[A-Za-z0-9_:+.-]{1,64}$/.test(key)) {
+      root.statusIsError = true
+      root.statusMessage = strings.t("manualShortcutInvalid")
+      return
+    }
+
+    var order = ["SUPER", "CTRL", "ALT", "SHIFT"]
+    var chord = []
+    for (var j = 0; j < order.length; j++)
+      if (modifiers.indexOf(order[j]) >= 0) chord.push(order[j])
+    chord.push(key)
+
+    root.capturedKeys = chord.join(" + ")
+    root.manualEntryActive = false
+    root.statusIsError = false
+    root.statusMessage = ""
+    root.page = "confirm"
+    root.confirmFocusIndex = 0
+    root.stopSafeCapture()
+    Qt.callLater(function() { saveShortcutButton.forceActiveFocus() })
   }
 
   function saveShortcut(replaceConflict) {
@@ -678,11 +824,13 @@ Item {
     } else if (root.page === "apps" || root.page === "actions") {
       root.returnFromTargetPage()
     } else if (root.page === "capture") {
+      root.stopSafeCapture()
+      root.manualEntryActive = false
       root.page = root.selectedSystemAction ? "actions" : "apps"
       Qt.callLater(function() { root.focusCurrentPage() })
     } else if (root.page === "confirm") {
       root.page = "capture"
-      Qt.callLater(function() { interactionInput.forceActiveFocus() })
+      Qt.callLater(function() { root.focusCurrentPage() })
     } else {
       if (root.page === "chooseType" && root.returnPageAfterTarget === "edit") {
         root.page = "edit"
@@ -697,8 +845,10 @@ Item {
     root.statusMessage = ""
     if (root.page === "confirm") {
       root.page = "capture"
-      Qt.callLater(function() { interactionInput.forceActiveFocus() })
+      Qt.callLater(function() { root.focusCurrentPage() })
     } else if (root.page === "capture") {
+      root.stopSafeCapture()
+      root.manualEntryActive = false
       root.page = root.selectedSystemAction ? "actions" : "apps"
       Qt.callLater(function() { root.focusCurrentPage() })
     } else if (root.page === "apps" || root.page === "actions") {
@@ -776,7 +926,9 @@ Item {
     BorderSurface {
       id: card
       width: Math.min(Style.space(480), panel.width - Style.gapsOut * 2)
-      height: Math.min(root.page === "apps" || root.page === "actions" || root.page === "edit" ? Style.space(500) : Style.space(360), panel.height - Style.gapsOut * 2)
+      height: Math.min(root.page === "apps" || root.page === "actions" || root.page === "edit"
+        ? Style.space(500) : root.page === "capture" ? Style.space(500) : Style.space(360),
+        panel.height - Style.gapsOut * 2)
       anchors.centerIn: parent
       color: Commons.Color.menu.background
       borderSpec: Border.surfaceSpec("menu", "border", Commons.Color.menu.border, Math.max(1, Style.space(2)))
@@ -795,6 +947,14 @@ Item {
         Keys.onPressed: function(event) {
           if (root.editDialogKey(event)) return
           if (root.page === "capture") {
+            if (root.manualEntryActive) {
+              if (event.key === Qt.Key_Escape) {
+                root.cancelFlow()
+                event.accepted = true
+              } else event.accepted = false
+              return
+            }
+            if (!root.captureModeActive) return
             root.captureKey(event)
             return
           }
@@ -834,12 +994,13 @@ Item {
           y: 0
           width: 1
           height: 1
-          visible: root.page === "capture" || overwriteDialog.opened || removeDialog.opened
+          visible: (root.page === "capture" && root.captureModeActive)
+            || overwriteDialog.opened || removeDialog.opened
           opacity: 0
-          focus: visible
+          focus: visible && !(root.page === "capture" && root.manualEntryActive)
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
-            if (root.page === "capture") root.captureKey(event)
+            if (root.page === "capture" && root.captureModeActive) root.captureKey(event)
             else root.editDialogKey(event)
             event.accepted = true
           }
@@ -1440,6 +1601,34 @@ Item {
               elide: Text.ElideRight
             }
 
+            Button {
+              id: captureStartButton
+              visible: !root.captureModeActive
+              width: parent.width
+              text: root.captureModePending
+                ? strings.t("startingCaptureMode")
+                : strings.t("startCaptureMode")
+              iconText: "󰌌"
+              fontFamily: root.fontFamily
+              foreground: Commons.Color.menu.text
+              leftAlign: true
+              focusable: true
+              enabled: !root.captureModePending && !helperProcess.running
+              Keys.onPressed: function(event) { root.handleButtonNavigation(event, "capture") }
+              onClicked: root.startSafeCapture()
+            }
+
+            Text {
+              width: parent.width
+              visible: root.captureModeActive
+              textFormat: Text.PlainText
+              text: strings.t("captureModeActive")
+              color: Commons.Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+
             BorderSurface {
               width: parent.width
               height: Style.space(112)
@@ -1482,6 +1671,67 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: strings.t("captureManualHelp")
+              color: Commons.Color.menu.text
+              opacity: 0.72
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            BorderSurface {
+              width: parent.width
+              height: Style.space(42)
+              color: Style.controlFill(false, false, Commons.Color.menu.text, Commons.Color.accent)
+              borderSpec: Border.controlSpec("normal", Commons.Color.menu.text, Commons.Color.accent)
+              radius: Style.cornerRadius
+
+              FilterInput {
+                id: manualShortcutInput
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: Style.spacing.md
+                anchors.rightMargin: Style.spacing.md
+                anchors.verticalCenter: parent.verticalCenter
+                height: parent.height
+                keyHandler: keyCatcher
+                focus: false
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                color: Commons.Color.menu.text
+                text: root.manualShortcutText
+                onActiveFocusChanged: {
+                  if (activeFocus) {
+                    root.stopSafeCapture()
+                    root.manualEntryActive = true
+                  } else {
+                    root.manualEntryActive = false
+                  }
+                }
+                onTextChanged: root.manualShortcutText = text
+                onAccepted: root.acceptManualShortcut()
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.md
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !manualShortcutInput.text && !manualShortcutInput.preeditText
+                textFormat: Text.PlainText
+                text: strings.t("captureManualPlaceholder")
+                color: Commons.Color.menu.text
+                opacity: 0.56
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                verticalAlignment: Text.AlignVCenter
+                enabled: false
+              }
             }
 
             Button {
