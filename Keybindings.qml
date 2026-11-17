@@ -12,6 +12,14 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
+  property bool autoSetupDone: false
+
+  onManifestChanged: {
+    if (root.manifest && !root.autoSetupDone && root.pluginDir) {
+      root.autoSetupDone = true
+      root.runHelper(["setup-auto"], "setup-auto")
+    }
+  }
 
   property bool opened: false
   property string page: "chooseType"
@@ -188,6 +196,11 @@ Item {
     root.pendingHelperTask = ""
     root.loading = false
     Qt.callLater(function() { root.startQueuedHelper() })
+
+    if (task === "setup-auto") {
+      // Silent auto-setup on first load; no UI feedback needed.
+      return
+    }
 
     var result = null
     try { result = JSON.parse(root.helperOutput || "") } catch (e) {}

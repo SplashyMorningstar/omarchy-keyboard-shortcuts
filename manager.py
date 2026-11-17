@@ -740,6 +740,27 @@ LOADER_CONTENT = (
     f"{LOADER_END}"
 )
 
+MENU_START = f"// BEGIN {PLUGIN_ID} menu entries"
+MENU_END = f"// END {PLUGIN_ID} menu entries"
+MENU_ENTRIES = """\
+  "setup.keybindings": {
+    "icon": "",
+    "label": "Keyboard Shortcuts",
+    "description": "Create and edit application and system shortcuts",
+    "action": ""
+  },
+  "setup.keybindings.create": {
+    "icon": "",
+    "label": "Create a shortcut",
+    "action": "omarchy-shell shell summon io.github.splashymorningstar.keybindings '{\\"mode\\":\\"create\\"}'"
+  },
+  "setup.keybindings.edit": {
+    "icon": "󰏫",
+    "label": "Edit a shortcut",
+    "action": "omarchy-shell shell summon io.github.splashymorningstar.keybindings '{\\"mode\\":\\"edit\\"}'"
+  }\
+"""
+
 
 def ensure_loader() -> bool:
     """Create the generated module and add one marked require to bindings.lua."""
@@ -804,17 +825,122 @@ def persist(records: list[dict[str, Any]], reload: bool = True) -> None:
     raise RuntimeError(f"shortcut wasn't applied: {message}")
 
 
+def menu_file() -> Path:
+    return (
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "omarchy"
+        / "extensions"
+        / "omarchy-menu.jsonc"
+    )
+
+
+def ensure_menu_entries() -> bool:
+    """Inject the plugin's menu entries into omarchy-menu.jsonc if absent.
+
+    Returns True if entries were added, False if already present.
+    Does nothing if the file already contains our block or the entry IDs.
+    """
+    path = menu_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        current = path.read_text(encoding="utf-8")
+    else:
+        # Create a minimal JSONC file with the standard header comment.
+        current = "{\n}\n"
+
+    if MENU_START in current:
+        return False
+    # Also skip if any of our keys are already present (manual install).
+    if '"setup.keybindings"' in current or '"setup.keybindings.create"' in current:
+        return False
+
+    # Find the last closing brace and insert before it.
+    last_brace = current.rfind("}")
+    if last_brace == -1:
+        raise RuntimeError(f"cannot parse {path}: no closing brace found")
+
+    before = current[:last_brace].rstrip()
+    # Add a comma after the previous entry if the content before the brace is non-empty JSON
+    # (i.e. not just whitespace/comments).
+    stripped = before
+    # Remove // line comments for the check
+    for line in before.splitlines():
+        stripped = stripped  # keep original for insertion
+    needs_comma = bool(re.search(r'[}\]"0-9]', before.split("//")[0] if "//" in before else before))
+
+    block = (
+        ((",\n  " if needs_comma else "\n  ") + f"// {MENU_START}\n  ")
+        + MENU_ENTRIES.replace("\n", "\n  ")
+        + f"\n  // {MENU_END}"
+    )
+    updated = before + block + "\n}\n"
+
+    backup_file(path)
+    write_atomic(path, updated.encode("utf-8"))
+    return True
+
+
+def remove_menu_entries() -> bool:
+    """Remove the managed menu block from omarchy-menu.jsonc if present.
+
+    Returns True if removed, False if the block was not found.
+    """
+    path = menu_file()
+    if not path.exists():
+        return False
+
+    current = path.read_text(encoding="utf-8")
+    start_marker = f"// {MENU_START}"
+    end_marker = f"// {MENU_END}"
+
+    if start_marker not in current:
+        return False
+
+    # Remove from the leading comma/newline before the start marker to end marker.
+    pattern = re.compile(
+        r",?\s*//\s*" + re.escape(MENU_START) + r".*?//\s*" + re.escape(MENU_END),
+        re.DOTALL,
+    )
+    updated = pattern.sub("", current)
+    if updated == current:
+        return False
+
+    backup_file(path)
+    write_atomic(path, updated.encode("utf-8"))
+    return True
+
+
+def ensure_custom_lua(plugin_dir: Path) -> None:
+    """Copy the starter custom Lua file if the user does not have one yet."""
+    dest = (
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "hypr"
+        / "omarchy-keybindings-custom.lua"
+    )
+    if dest.exists():
+        return
+    source = plugin_dir / "examples" / "omarchy-keybindings-custom.lua"
+    if not source.is_file():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+
+
 def install() -> None:
+    plugin_dir = Path(__file__).parent
     generated = generated_file()
     user_bindings = bindings_file()
     old_generated = snapshot(generated)
     old_bindings = snapshot(user_bindings)
     try:
-        changed = ensure_loader()
+        loader_changed = ensure_loader()
+        ensure_custom_lua(plugin_dir)
+        ensure_menu_entries()
         records = load_records()
         if generated.exists():
             write_atomic(generated, render_lua(records))
-        if not changed:
+        if not loader_changed:
             emit({"ok": True, "message": "already installed"})
             return
         try:
@@ -870,6 +996,7 @@ def uninstall() -> None:
         restore_snapshot(user_bindings, old_bindings)
         reload_hyprland()
         raise RuntimeError(f"couldn't remove the shortcut manager: {message}")
+    remove_menu_entries()
     emit(
         {
             "ok": True,
@@ -1035,6 +1162,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("install")
     commands.add_parser("uninstall")
+    commands.add_parser("setup-auto")
     commands.add_parser("list-custom")
     commands.add_parser("list-system")
     commands.add_parser("capture-start")
@@ -1128,6 +1256,29 @@ def main(argv: list[str] | None = None) -> int:
                 expected_conflict_from_args(args),
             )
             emit({"ok": True, "entry": entry})
+        elif args.command == "setup-auto":
+            # Silent auto-setup called from QML on first load. Never raises
+            # on non-critical failures so the plugin opens normally even on
+            # unusual system configurations.
+            plugin_dir = Path(__file__).parent
+            try:
+                ensure_custom_lua(plugin_dir)
+                ensure_menu_entries()
+                ensure_loader()
+                records = load_records()
+                generated = generated_file()
+                if not generated.exists():
+                    write_atomic(generated, render_lua(records))
+                # Best-effort Hyprland reload; ignore errors silently.
+                try:
+                    before = config_errors()
+                    reload_hyprland(before)
+                except Exception:
+                    pass
+            except Exception as exc:
+                emit({"ok": False, "kind": "error", "message": clean_text(str(exc), 500)})
+                return 0  # Exit 0 so QML doesn't treat it as fatal
+            emit({"ok": True, "message": "auto-setup complete"})
         elif args.command == "remove":
             remove_record(args.id)
             emit({"ok": True})

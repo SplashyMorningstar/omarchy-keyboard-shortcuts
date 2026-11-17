@@ -46,48 +46,15 @@ and write their own `o.bind(...)` or `o.rebind(...)` commands.
 
 ## Installation
 
-Community installation starts with the public GitHub repository:
-
 ```sh
-omarchy plugin add https://github.com/SplashyMorningstar/omarchy-keyboard-shortcuts.git
+omarchy plugin add https://github.com/SplashyMorningstar/omarchy-keyboard-shortcuts.git --enable
 ```
 
-Replace the URL if you choose a different repository name.
+The plugin sets itself up on first use: it adds the Hyprland loader, the
+menu entries, and the starter custom-command file automatically.
+
 Review the source before enabling it: Omarchy plugins run unsandboxed inside
-the long-lived shell process. Then enable the plugin:
-
-```sh
-omarchy plugin enable io.github.splashymorningstar.keybindings
-```
-
-### Add the menu entries
-
-Merge the entries in
-[`examples/omarchy-menu.jsonc`](examples/omarchy-menu.jsonc) into
-`~/.config/omarchy/extensions/omarchy-menu.jsonc`. Add them to the existing
-JSONC object; do not replace the file if it contains other custom menu entries.
-
-### Set up Hyprland
-
-The manager writes generated shortcuts to
-`~/.config/hypr/omarchy-keybindings.lua` and adds a marked `require(...)` block
-to `~/.config/hypr/bindings.lua`. It makes a backup before changing either
-file. The custom Lua file is never overwritten; copy the starter only if the
-destination does not already exist:
-
-```sh
-PLUGIN_DIR="$HOME/.config/omarchy/plugins/io.github.splashymorningstar.keybindings"
-mkdir -p "$HOME/.config/hypr"
-cp -n "$PLUGIN_DIR/examples/omarchy-keybindings-custom.lua" \
-  "$HOME/.config/hypr/omarchy-keybindings-custom.lua"
-python3 "$PLUGIN_DIR/manager.py" install
-hyprctl reload
-hyprctl configerrors
-```
-
-The manager stores shortcut data in
-`~/.local/state/omarchy/keybindings-manager/bindings.json`. It does not edit
-Omarchy's packaged defaults or use `sudo`.
+the long-lived shell process.
 
 ## Custom commands
 
@@ -114,10 +81,10 @@ python3 "$PLUGIN_DIR/manager.py" uninstall
 ```
 
 It removes only this plugin's exact marked loader block, backs up
-`bindings.lua`, and reloads Hyprland. It preserves the generated module,
-shortcut database, and custom Lua file so they remain available if you
-reinstall. Then remove the three `setup.keybindings` entries from the Omarchy
-menu extension and remove the plugin:
+`bindings.lua`, reloads Hyprland, and cleans up the managed menu entries
+automatically. It preserves the generated module, shortcut database, and
+custom Lua file so they remain available if you reinstall. Then remove the
+plugin:
 
 ```sh
 omarchy plugin remove io.github.splashymorningstar.keybindings
