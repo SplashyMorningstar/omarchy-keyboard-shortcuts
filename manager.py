@@ -85,6 +85,10 @@ def database_file() -> Path:
     return state_dir() / "bindings.json"
 
 
+def custom_lua_file() -> Path:
+    return config_dir() / "hypr" / "omarchy-keybindings-custom.lua"
+
+
 def backup_dir() -> Path:
     return state_dir() / "backups"
 
@@ -732,6 +736,31 @@ def restore_snapshot(path: Path, content: bytes | None) -> None:
         write_atomic(path, content, mode)
 
 
+class ConfigTransaction:
+    """Snapshot every file a setup step may change so it can all be undone."""
+
+    def __init__(self, paths: list[Path]):
+        self.paths = [Path(path) for path in paths]
+        self.snapshots: dict[Path, bytes | None] = {}
+
+    def __enter__(self) -> ConfigTransaction:
+        for path in self.paths:
+            self.snapshots[path] = snapshot(path)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return False
+
+    def rollback(self) -> list[str]:
+        failures = []
+        for path in reversed(self.paths):
+            try:
+                restore_snapshot(path, self.snapshots.get(path))
+            except Exception as error:
+                failures.append(f"{path.name}: {error}")
+        return failures
+
+
 LOADER_START = f"-- BEGIN {PLUGIN_ID} managed loader"
 LOADER_END = f"-- END {PLUGIN_ID} managed loader"
 LOADER_CONTENT = (
@@ -762,14 +791,14 @@ MENU_ENTRIES = """\
 """
 
 
-def ensure_loader() -> bool:
+def ensure_loader(records: list[dict[str, Any]] | None = None) -> bool:
     """Create the generated module and add one marked require to bindings.lua."""
     user_bindings = bindings_file()
     if not user_bindings.is_file():
         raise RuntimeError(f"Hyprland bindings file not found: {user_bindings}")
     generated = generated_file()
     if not generated.exists():
-        write_atomic(generated, render_lua([]))
+        write_atomic(generated, render_lua(records or []))
 
     current = user_bindings.read_text(encoding="utf-8")
     if LOADER_START in current and LOADER_END in current:
@@ -834,6 +863,25 @@ def menu_file() -> Path:
     )
 
 
+def menu_block() -> str:
+    """Return the exact block owned by this plugin in omarchy-menu.jsonc."""
+    return f"// {MENU_START}\n  " + MENU_ENTRIES.replace("\n", "\n  ") + f"\n  // {MENU_END}"
+
+
+def find_menu_block(current: str) -> tuple[int, int] | None:
+    start_marker = f"// {MENU_START}"
+    end_marker = f"// {MENU_END}"
+    has_start = start_marker in current
+    has_end = end_marker in current
+    if not has_start and not has_end:
+        return None
+    if not has_start or not has_end:
+        raise RuntimeError("the managed menu markers are incomplete")
+    start = current.index(start_marker)
+    end = current.index(end_marker, start) + len(end_marker)
+    return start, end
+
+
 def ensure_menu_entries() -> bool:
     """Inject the plugin's menu entries into omarchy-menu.jsonc if absent.
 
@@ -849,7 +897,7 @@ def ensure_menu_entries() -> bool:
         # Create a minimal JSONC file with the standard header comment.
         current = "{\n}\n"
 
-    if MENU_START in current:
+    if find_menu_block(current) is not None:
         return False
     # Also skip if any of our keys are already present (manual install).
     if '"setup.keybindings"' in current or '"setup.keybindings.create"' in current:
@@ -863,146 +911,208 @@ def ensure_menu_entries() -> bool:
     before = current[:last_brace].rstrip()
     # Add a comma after the previous entry if the content before the brace is non-empty JSON
     # (i.e. not just whitespace/comments).
-    stripped = before
-    # Remove // line comments for the check
-    for line in before.splitlines():
-        stripped = stripped  # keep original for insertion
     needs_comma = bool(re.search(r'[}\]"0-9]', before.split("//")[0] if "//" in before else before))
+    separator = ",\n  " if needs_comma else "\n  "
+    updated = before + separator + menu_block() + "\n}\n"
 
-    block = (
-        ((",\n  " if needs_comma else "\n  ") + f"// {MENU_START}\n  ")
-        + MENU_ENTRIES.replace("\n", "\n  ")
-        + f"\n  // {MENU_END}"
-    )
-    updated = before + block + "\n}\n"
-
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
     backup_file(path)
-    write_atomic(path, updated.encode("utf-8"))
+    write_atomic(path, updated.encode("utf-8"), mode)
     return True
 
 
-def remove_menu_entries() -> bool:
-    """Remove the managed menu block from omarchy-menu.jsonc if present.
+def remove_menu_entries() -> tuple[bool, str | None]:
+    """Remove the exact managed menu block, leaving any user edits in place.
 
-    Returns True if removed, False if the block was not found.
+    Returns (removed, warning). A partial setup can leave this block behind
+    without a loader, so callers must not tie cleanup to the loader state.
     """
     path = menu_file()
     if not path.exists():
-        return False
+        return False, None
 
     current = path.read_text(encoding="utf-8")
-    start_marker = f"// {MENU_START}"
-    end_marker = f"// {MENU_END}"
+    try:
+        location = find_menu_block(current)
+    except RuntimeError as error:
+        return False, str(error)
+    if location is None:
+        return False, None
 
-    if start_marker not in current:
-        return False
+    start, end = location
+    if current[start:end] != menu_block():
+        return False, "the managed menu block was edited; leaving it unchanged"
 
     # Remove from the leading comma/newline before the start marker to end marker.
     pattern = re.compile(
         r",?\s*//\s*" + re.escape(MENU_START) + r".*?//\s*" + re.escape(MENU_END),
         re.DOTALL,
     )
-    updated = pattern.sub("", current)
+    updated = pattern.sub("", current, count=1)
     if updated == current:
-        return False
+        return False, "couldn't remove the managed menu block"
 
+    mode = path.stat().st_mode & 0o777
     backup_file(path)
-    write_atomic(path, updated.encode("utf-8"))
+    write_atomic(path, updated.encode("utf-8"), mode)
+    return True, None
+
+
+def ensure_custom_lua(plugin_dir: Path) -> bool:
+    """Copy the starter custom Lua file if the user does not have one yet."""
+    dest = custom_lua_file()
+    if dest.exists():
+        return False
+    source = plugin_dir / "examples" / "omarchy-keybindings-custom.lua"
+    if not source.is_file():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
     return True
 
 
-def ensure_custom_lua(plugin_dir: Path) -> None:
-    """Copy the starter custom Lua file if the user does not have one yet."""
-    dest = (
-        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        / "hypr"
-        / "omarchy-keybindings-custom.lua"
-    )
-    if dest.exists():
-        return
-    source = plugin_dir / "examples" / "omarchy-keybindings-custom.lua"
-    if not source.is_file():
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, dest)
+def setup_config_paths() -> list[Path]:
+    """Every config file touched by automatic or explicit setup."""
+    return [menu_file(), bindings_file(), generated_file(), custom_lua_file()]
 
 
-def install() -> None:
-    plugin_dir = Path(__file__).parent
-    generated = generated_file()
-    user_bindings = bindings_file()
-    old_generated = snapshot(generated)
-    old_bindings = snapshot(user_bindings)
+def validate_reload(failure_message: str) -> None:
+    """Reload Hyprland and turn a failed validation into an actionable error."""
     try:
-        loader_changed = ensure_loader()
-        ensure_custom_lua(plugin_dir)
-        ensure_menu_entries()
-        records = load_records()
-        if generated.exists():
-            write_atomic(generated, render_lua(records))
-        if not loader_changed:
-            emit({"ok": True, "message": "already installed"})
-            return
+        before = config_errors()
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+        raise RuntimeError(f"{failure_message}: {error}") from error
+    success, message = reload_hyprland(before)
+    if not success:
+        raise RuntimeError(f"{failure_message}: {message}")
+
+
+def rollback_and_reraise(transaction: ConfigTransaction, changed: bool, error: Exception) -> None:
+    failures = transaction.rollback()
+    if changed:
+        # Drop the partially applied configuration from the running compositor.
         try:
-            before = config_errors()
-        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-            raise RuntimeError(f"couldn't validate Hyprland configuration: {error}") from error
-        success, message = reload_hyprland(before)
-        if not success:
-            raise RuntimeError(f"couldn't load the shortcut manager: {message}")
-    except Exception:
-        restore_snapshot(user_bindings, old_bindings)
-        restore_snapshot(generated, old_generated)
-        reload_hyprland()
-        raise
-    emit({"ok": True, "message": "installed"})
+            reload_hyprland()
+        except Exception:
+            pass
+    if failures:
+        raise RuntimeError(f"{error}; couldn't restore every file: {'; '.join(failures)}") from error
+    raise error
 
 
-def uninstall() -> None:
-    """Remove only the exact loader block owned by this plugin."""
+def remove_loader_block() -> tuple[bool, str | None]:
+    """Remove the exact loader block, leaving user edits and manual requires alone."""
     user_bindings = bindings_file()
     if not user_bindings.is_file():
         raise RuntimeError(f"Hyprland bindings file not found: {user_bindings}")
 
     current = user_bindings.read_text(encoding="utf-8")
-    if LOADER_START not in current and LOADER_END not in current:
-        emit({"ok": True, "message": "no managed loader found; nothing changed"})
-        return
+    has_start = LOADER_START in current
+    has_end = LOADER_END in current
+    if not has_start and not has_end:
+        return False, None
+    if not has_start or not has_end:
+        return False, "the managed loader markers are incomplete; leaving them unchanged"
     if current.count(LOADER_START) != 1 or current.count(LOADER_END) != 1:
-        raise RuntimeError("the managed loader markers are incomplete or duplicated")
+        return False, "the managed loader markers appear more than once; leaving them unchanged"
 
     start = current.index(LOADER_START)
     end_marker = current.index(LOADER_END) + len(LOADER_END)
     if end_marker < start or current[start:end_marker] != LOADER_CONTENT.rstrip("\n"):
-        raise RuntimeError("the managed loader block was edited; leaving it unchanged")
+        return False, "the managed loader block was edited; leaving it unchanged"
 
     remove_start = start
     if current[max(0, start - 2):start] == "\n\n":
         remove_start -= 1
     remove_end = end_marker + (1 if current[end_marker:end_marker + 1] == "\n" else 0)
     updated = current[:remove_start] + current[remove_end:]
-    old_bindings = current.encode("utf-8")
 
+    mode = user_bindings.stat().st_mode & 0o777
     backup_file(user_bindings)
-    write_atomic(user_bindings, updated.encode("utf-8"), user_bindings.stat().st_mode & 0o777)
-    try:
-        before = config_errors()
-    except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
-        restore_snapshot(user_bindings, old_bindings)
-        raise RuntimeError(f"couldn't validate Hyprland configuration: {error}") from error
+    write_atomic(user_bindings, updated.encode("utf-8"), mode)
+    return True, None
 
-    success, message = reload_hyprland(before)
-    if not success:
-        restore_snapshot(user_bindings, old_bindings)
-        reload_hyprland()
-        raise RuntimeError(f"couldn't remove the shortcut manager: {message}")
-    remove_menu_entries()
-    emit(
-        {
-            "ok": True,
-            "message": "managed loader removed; shortcut data and user custom config were preserved",
-        }
-    )
+
+def install() -> None:
+    plugin_dir = Path(__file__).parent
+    generated = generated_file()
+    transaction = ConfigTransaction(setup_config_paths())
+    changed = False
+    with transaction:
+        try:
+            records = load_records()
+            loader_changed = ensure_loader(records)
+            custom_changed = ensure_custom_lua(plugin_dir)
+            menu_changed = ensure_menu_entries()
+            rendered = render_lua(records)
+            generated_changed = snapshot(generated) != rendered
+            if generated_changed:
+                mode = generated.stat().st_mode & 0o777 if generated.exists() else 0o600
+                write_atomic(generated, rendered, mode)
+            changed = any((loader_changed, custom_changed, menu_changed, generated_changed))
+            if changed:
+                validate_reload("couldn't load the shortcut manager")
+        except Exception as error:
+            rollback_and_reraise(transaction, changed, error)
+
+    if not changed:
+        emit({"ok": True, "message": "already installed"})
+        return
+    emit({"ok": True, "message": "installed"})
+
+
+def setup() -> None:
+    """Transactional first-open setup; any failure restores every file it touched."""
+    plugin_dir = Path(__file__).parent
+    transaction = ConfigTransaction(setup_config_paths())
+    changed = False
+    with transaction:
+        try:
+            records = load_records()
+            custom_changed = ensure_custom_lua(plugin_dir)
+            menu_changed = ensure_menu_entries()
+            loader_changed = ensure_loader(records)
+            changed = any((custom_changed, menu_changed, loader_changed))
+            if changed:
+                validate_reload("couldn't validate Hyprland configuration")
+        except Exception as error:
+            rollback_and_reraise(transaction, changed, error)
+    emit({"ok": True, "message": "auto-setup complete"})
+
+
+def uninstall() -> None:
+    """Remove owned loader and menu blocks, including after a partial setup."""
+    if not bindings_file().is_file():
+        raise RuntimeError(f"Hyprland bindings file not found: {bindings_file()}")
+
+    transaction = ConfigTransaction([bindings_file(), menu_file()])
+    warnings: list[str] = []
+    changed = False
+    with transaction:
+        try:
+            loader_changed, loader_warning = remove_loader_block()
+            menu_changed, menu_warning = remove_menu_entries()
+            if loader_warning:
+                warnings.append(loader_warning)
+            if menu_warning:
+                warnings.append(menu_warning)
+            changed = loader_changed or menu_changed
+            if changed:
+                validate_reload("couldn't validate Hyprland configuration")
+        except Exception as error:
+            rollback_and_reraise(transaction, changed, error)
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "message": (
+            "managed configuration removed; shortcut data and user custom config were preserved"
+            if changed
+            else "no managed configuration found; nothing changed"
+        ),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    emit(payload)
 
 
 def save_app(
@@ -1257,28 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             emit({"ok": True, "entry": entry})
         elif args.command == "setup-auto":
-            # Silent auto-setup called from QML on first load. Never raises
-            # on non-critical failures so the plugin opens normally even on
-            # unusual system configurations.
-            plugin_dir = Path(__file__).parent
-            try:
-                ensure_custom_lua(plugin_dir)
-                ensure_menu_entries()
-                ensure_loader()
-                records = load_records()
-                generated = generated_file()
-                if not generated.exists():
-                    write_atomic(generated, render_lua(records))
-                # Best-effort Hyprland reload; ignore errors silently.
-                try:
-                    before = config_errors()
-                    reload_hyprland(before)
-                except Exception:
-                    pass
-            except Exception as exc:
-                emit({"ok": False, "kind": "error", "message": clean_text(str(exc), 500)})
-                return 0  # Exit 0 so QML doesn't treat it as fatal
-            emit({"ok": True, "message": "auto-setup complete"})
+            setup()
         elif args.command == "remove":
             remove_record(args.id)
             emit({"ok": True})

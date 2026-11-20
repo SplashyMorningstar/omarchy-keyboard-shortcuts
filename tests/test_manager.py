@@ -131,10 +131,13 @@ class ShortcutManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            menu.write_text("{\n}\n", encoding="utf-8")
             user_content = "-- my other bindings\n"
             path.write_text(user_content + "\n" + manager.LOADER_CONTENT + "\n", encoding="utf-8")
             with (
                 patch.object(manager, "bindings_file", return_value=path),
+                patch.object(manager, "menu_file", return_value=menu),
                 patch.object(manager, "backup_dir", return_value=root / "backups"),
                 patch.object(manager, "config_errors", return_value=[]),
                 patch.object(manager, "reload_hyprland", return_value=(True, "")) as reload_hyprland,
@@ -148,11 +151,15 @@ class ShortcutManagerTests(unittest.TestCase):
 
     def test_uninstall_leaves_an_unmarked_manual_require_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bindings.lua"
+            root = Path(directory)
+            path = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            menu.write_text("{\n}\n", encoding="utf-8")
             manual = 'require("hypr.omarchy-keybindings")\n'
             path.write_text(manual, encoding="utf-8")
             with (
                 patch.object(manager, "bindings_file", return_value=path),
+                patch.object(manager, "menu_file", return_value=menu),
                 patch.object(manager, "emit"),
                 patch.object(manager, "reload_hyprland") as reload_hyprland,
             ):
@@ -161,19 +168,52 @@ class ShortcutManagerTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), manual)
             reload_hyprland.assert_not_called()
 
-    def test_uninstall_refuses_to_remove_an_edited_loader_block(self):
+    def test_uninstall_leaves_an_edited_loader_block_but_still_cleans_menu(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bindings.lua"
+            root = Path(directory)
+            path = root / "bindings.lua"
+            menu = root / "menu.jsonc"
             edited = manager.LOADER_CONTENT.replace(
                 'require("hypr.omarchy-keybindings")',
                 'require("hypr.some-other-module")',
             )
             path.write_text(edited + "\n", encoding="utf-8")
-            with patch.object(manager, "bindings_file", return_value=path):
-                with self.assertRaisesRegex(RuntimeError, "block was edited"):
-                    manager.uninstall()
+            menu.write_text("{\n  " + manager.menu_block() + "\n}\n", encoding="utf-8")
+            emitted = []
+            with (
+                patch.object(manager, "bindings_file", return_value=path),
+                patch.object(manager, "menu_file", return_value=menu),
+                patch.object(manager, "backup_dir", return_value=root / "backups"),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "reload_hyprland", return_value=(True, "")),
+                patch.object(manager, "emit", side_effect=emitted.append),
+            ):
+                manager.uninstall()
 
             self.assertEqual(path.read_text(encoding="utf-8"), edited + "\n")
+            self.assertNotIn("setup.keybindings", menu.read_text(encoding="utf-8"))
+            self.assertTrue(any("loader block was edited" in warning for warning in emitted[0]["warnings"]))
+
+    def test_uninstall_removes_menu_block_when_loader_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bindings = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            bindings.write_text("-- user bindings\n", encoding="utf-8")
+            menu.write_text("{\n  " + manager.menu_block() + "\n}\n", encoding="utf-8")
+            with (
+                patch.object(manager, "bindings_file", return_value=bindings),
+                patch.object(manager, "menu_file", return_value=menu),
+                patch.object(manager, "backup_dir", return_value=root / "backups"),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "reload_hyprland", return_value=(True, "")) as reload,
+                patch.object(manager, "emit"),
+            ):
+                manager.uninstall()
+
+            self.assertNotIn("setup.keybindings", menu.read_text(encoding="utf-8"))
+            self.assertEqual(bindings.read_text(encoding="utf-8"), "-- user bindings\n")
+            reload.assert_called_once_with([])
 
     def test_conflict_detection_compares_case_insensitively(self):
         binds = [{"key": "d", "modmask": 65, "description": "Existing app"}]
@@ -537,6 +577,116 @@ class ShortcutManagerTests(unittest.TestCase):
 
             reload.assert_called_once_with([])
             self.assertFalse(state_path.exists())
+
+    def test_setup_auto_reports_validation_failure_and_restores_all_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bindings = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            generated = root / "generated.lua"
+            custom = root / "custom.lua"
+            original_bindings = "-- user bindings\n"
+            original_menu = '{\n  "keep": true\n}\n'
+            bindings.write_text(original_bindings, encoding="utf-8")
+            menu.write_text(original_menu, encoding="utf-8")
+            emitted = []
+            with (
+                patch.object(manager, "bindings_file", return_value=bindings),
+                patch.object(manager, "menu_file", return_value=menu),
+                patch.object(manager, "generated_file", return_value=generated),
+                patch.object(manager, "custom_lua_file", return_value=custom),
+                patch.object(manager, "database_file", return_value=root / "bindings.json"),
+                patch.object(manager, "backup_dir", return_value=root / "backups"),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "reload_hyprland", return_value=(False, "bad config")),
+                patch.object(manager, "emit", side_effect=emitted.append),
+            ):
+                code = manager.main(["setup-auto"])
+
+            self.assertEqual(code, 1)
+            self.assertFalse(emitted[0]["ok"])
+            self.assertIn("bad config", emitted[0]["message"])
+            self.assertEqual(bindings.read_text(encoding="utf-8"), original_bindings)
+            self.assertEqual(menu.read_text(encoding="utf-8"), original_menu)
+            self.assertFalse(generated.exists())
+            self.assertFalse(custom.exists())
+
+    def test_setup_auto_creates_managed_files_from_saved_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bindings = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            generated = root / "generated.lua"
+            custom = root / "custom.lua"
+            database = root / "bindings.json"
+            bindings.write_text("-- user bindings\n", encoding="utf-8")
+            menu.write_text("{\n}\n", encoding="utf-8")
+            database.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "entry-1",
+                            "kind": "application",
+                            "desktopId": "example",
+                            "name": "Example",
+                            "keys": "SUPER + E",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            emitted = []
+            with (
+                patch.object(manager, "bindings_file", return_value=bindings),
+                patch.object(manager, "menu_file", return_value=menu),
+                patch.object(manager, "generated_file", return_value=generated),
+                patch.object(manager, "custom_lua_file", return_value=custom),
+                patch.object(manager, "database_file", return_value=database),
+                patch.object(manager, "backup_dir", return_value=root / "backups"),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "reload_hyprland", return_value=(True, "")),
+                patch.object(manager, "emit", side_effect=emitted.append),
+            ):
+                code = manager.main(["setup-auto"])
+
+            self.assertEqual(code, 0)
+            self.assertTrue(emitted[0]["ok"])
+            self.assertIn(manager.LOADER_CONTENT, bindings.read_text(encoding="utf-8"))
+            self.assertIn(manager.menu_block(), menu.read_text(encoding="utf-8"))
+            self.assertTrue(custom.exists())
+            self.assertIn(
+                'o.bind("SUPER + E", "Example", { launch = "gtk-launch example.desktop" })',
+                generated.read_text(encoding="utf-8"),
+            )
+
+    def test_install_rolls_back_menu_and_custom_lua_on_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bindings = root / "bindings.lua"
+            menu = root / "menu.jsonc"
+            generated = root / "generated.lua"
+            custom = root / "custom.lua"
+            original_bindings = "-- user bindings\n"
+            original_menu = '{\n  "keep": true\n}\n'
+            bindings.write_text(original_bindings, encoding="utf-8")
+            menu.write_text(original_menu, encoding="utf-8")
+            with (
+                patch.object(manager, "bindings_file", return_value=bindings),
+                patch.object(manager, "menu_file", return_value=menu),
+                patch.object(manager, "generated_file", return_value=generated),
+                patch.object(manager, "custom_lua_file", return_value=custom),
+                patch.object(manager, "database_file", return_value=root / "bindings.json"),
+                patch.object(manager, "backup_dir", return_value=root / "backups"),
+                patch.object(manager, "config_errors", return_value=[]),
+                patch.object(manager, "reload_hyprland", return_value=(False, "bad config")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bad config"):
+                    manager.install()
+
+            self.assertEqual(bindings.read_text(encoding="utf-8"), original_bindings)
+            self.assertEqual(menu.read_text(encoding="utf-8"), original_menu)
+            self.assertFalse(generated.exists())
+            self.assertFalse(custom.exists())
 
 
 if __name__ == "__main__":

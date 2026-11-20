@@ -60,6 +60,7 @@
   "conflictConfirm": "The shortcut %1 is already in use for %2. Rewrite that binding?",
   "conflictCanceled": "No changes made. Choose another shortcut or try again.",
   "conflictReserved": "This shortcut is reserved by another managed shortcut (%1). Edit that shortcut first.",
+  "setupFailed": "Setup couldn't be completed; changes were reverted: %1",
   "saveFailed": "Couldn't save the shortcut: %1",
   "saved": "Shortcut saved",
   "removed": "Shortcut removed",

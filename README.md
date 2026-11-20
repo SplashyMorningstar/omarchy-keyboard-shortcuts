@@ -51,7 +51,9 @@ omarchy plugin add https://github.com/SplashyMorningstar/omarchy-keyboard-shortc
 ```
 
 The plugin sets itself up on first use: it adds the Hyprland loader, the
-menu entries, and the starter custom-command file automatically.
+menu entries, and the starter custom-command file automatically. Setup is
+transactional: if Hyprland validation fails, every changed file is restored
+and the error is shown in the panel instead of being silently ignored.
 
 Review the source before enabling it: Omarchy plugins run unsandboxed inside
 the long-lived shell process.
@@ -82,9 +84,10 @@ python3 "$PLUGIN_DIR/manager.py" uninstall
 
 It removes only this plugin's exact marked loader block, backs up
 `bindings.lua`, reloads Hyprland, and cleans up the managed menu entries
-automatically. It preserves the generated module, shortcut database, and
-custom Lua file so they remain available if you reinstall. Then remove the
-plugin:
+automatically—even when setup stopped before the loader was written. Blocks
+that were edited by the user are left untouched and reported as warnings. It
+preserves the generated module, shortcut database, and custom Lua file so they
+remain available if you reinstall. Then remove the plugin:
 
 ```sh
 omarchy plugin remove io.github.splashymorningstar.keybindings

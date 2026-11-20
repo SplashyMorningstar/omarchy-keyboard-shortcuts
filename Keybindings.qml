@@ -13,6 +13,7 @@ Item {
   property var shell: null
   property var manifest: null
   property bool autoSetupDone: false
+  property string setupFailureDetail: ""
 
   onManifestChanged: {
     if (root.manifest && !root.autoSetupDone && root.pluginDir) {
@@ -132,11 +133,19 @@ Item {
     root.statusMessage = ""
     if (payload.mode === "edit") root.startEdit()
     else root.startCreate()
+    root.showSetupFailure()
+  }
+
+  function showSetupFailure() {
+    if (!root.setupFailureDetail) return
+    root.statusIsError = true
+    root.statusMessage = strings.t("setupFailed").arg(root.setupFailureDetail)
   }
 
   function close() {
     root.stopSafeCapture()
     root.opened = false
+    root.setupFailureDetail = ""
   }
 
   function dismiss() {
@@ -198,7 +207,14 @@ Item {
     Qt.callLater(function() { root.startQueuedHelper() })
 
     if (task === "setup-auto") {
-      // Silent auto-setup on first load; no UI feedback needed.
+      if (result && result.ok) {
+        root.setupFailureDetail = ""
+        return
+      }
+      root.setupFailureDetail = (result && result.message)
+        || root.helperStderr
+        || "No response from the shortcut manager."
+      if (root.opened) root.showSetupFailure()
       return
     }
 

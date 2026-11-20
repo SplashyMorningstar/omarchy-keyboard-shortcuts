@@ -60,6 +60,7 @@
   "conflictConfirm": "El atajo %1 ya está en uso para %2. ¿Quieres reescribirlo?",
   "conflictCanceled": "No se hicieron cambios. Elige otro atajo o inténtalo de nuevo.",
   "conflictReserved": "Este atajo está reservado por otro atajo administrado (%1). Edita ese atajo primero.",
+  "setupFailed": "No se pudo completar la configuración; se revertieron los cambios: %1",
   "saveFailed": "No se pudo guardar el atajo: %1",
   "saved": "Atajo guardado",
   "removed": "Atajo eliminado",
